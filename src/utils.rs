@@ -119,7 +119,7 @@ pub fn prompt(prompt: &str, default_response: bool) -> bool {
 }
 
 pub fn is_inside_ci() -> bool {
-    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("1")
+    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
 }
 
 pub fn read_line() -> String {

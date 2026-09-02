@@ -88,6 +88,13 @@ impl JoshFilter {
 }
 
 fn josh_install_directory() -> PathBuf {
+    // Install binaries globally (into CARGO_HOME) on CI to ensure better (rust-)cache usage
+    if is_inside_ci()
+        && let Some(dirs) = directories::UserDirs::new()
+    {
+        return dirs.home_dir().join(".cargo");
+    }
+
     let Some(user_dirs) = directories::ProjectDirs::from("org", "rust-lang", "rustc-josh") else {
         eprintln!(
             "Cannot determine user directory for Josh installation, falling back to local directory"
@@ -134,12 +141,9 @@ fn try_install_josh_program(program: JoshProgram, verbose: bool) -> Option<PathB
         "https://github.com/josh-project/josh",
         "--tag",
         JOSH_VERSION,
+        "--root",
+        install_dir.to_str()?,
     ];
-
-    // Install binaries globally on CI to ensure better (rust-)cache usage
-    if !is_inside_ci() {
-        args.extend(["--root", install_dir.to_str()?]);
-    }
 
     args.push(krate);
 
