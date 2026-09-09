@@ -1,16 +1,13 @@
 use anyhow::Context;
 use clap::Parser;
-use rustc_josh_sync::SyncContext;
-use rustc_josh_sync::config::{JoshConfig, load_config};
-use rustc_josh_sync::josh::{JoshProxy, try_install_josh_proxy};
-use rustc_josh_sync::sync::{
-    DEFAULT_UPSTREAM_REPO, FilterVersion, GitSync, PushResult, RustcPullError,
-};
-use rustc_josh_sync::utils::{get_current_head_sha, is_inside_ci, prompt};
+use josh_sync::SyncContext;
+use josh_sync::config::{JoshConfig, load_config};
+use josh_sync::josh::{JoshProxy, try_install_josh_proxy};
+use josh_sync::sync::{DEFAULT_UPSTREAM_REPO, FilterVersion, GitSync, PushResult, RustcPullError};
+use josh_sync::utils::{get_current_head_sha, is_inside_ci, prompt};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_CONFIG_PATH: &str = "josh-sync.toml";
-const DEFAULT_RUST_VERSION_PATH: &str = "rust-version";
 
 #[derive(clap::Parser)]
 struct Args {
@@ -20,14 +17,13 @@ struct Args {
 
 #[derive(clap::Parser)]
 enum Command {
-    /// Initialize a config file and an empty `rust-version` file for this repository.
+    /// Initialize a config file for this repository.
     Init,
     /// Pull changes from the configured upstream repository.
     /// This creates new commits that should be then merged into this subtree repository.
     Pull {
         /// Override the upstream repository from which we pull changes.
-        /// Can be used to perform experimental pulls e.g. to test changes in the subtree repository
-        /// that have not yet been merged in `rust-lang/rust`.
+        /// Can be used to test changes that have not yet reached the configured upstream.
         #[clap(long)]
         upstream_repo: Option<String>,
 
@@ -62,9 +58,17 @@ struct SharedArgs {
     #[clap(long, default_value(DEFAULT_CONFIG_PATH))]
     config_path: PathBuf,
 
-    /// Path to a file storing the last synchronized rustc commit.
-    #[clap(long, default_value(DEFAULT_RUST_VERSION_PATH))]
-    rust_version_path: PathBuf,
+    /// Override the mirror's GitHub organization/repository.
+    #[clap(long)]
+    mirror: Option<String>,
+
+    /// Override the configured Josh filter.
+    #[clap(long)]
+    filter: Option<String>,
+
+    /// Branch used as the upstream source and reconciliation base.
+    #[clap(long)]
+    upstream_branch: Option<String>,
 
     /// Path to a local josh-proxy binary (outside CI only).
     /// Without a proxy URL or binary, it will be installed outside CI.
@@ -87,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     match args.cmd {
         Command::Init => {
             let config = JoshConfig {
-                org: "rust-lang".to_string(),
+                org: "<organization>".to_string(),
                 repo: "<repository-name>".to_string(),
                 upstream_repo: DEFAULT_UPSTREAM_REPO.to_string(),
                 upstream_branch: "HEAD".to_string(),
@@ -104,14 +108,6 @@ fn main() -> anyhow::Result<()> {
                 .write(Path::new(DEFAULT_CONFIG_PATH))
                 .context("cannot write config")?;
             println!("Created config file at {DEFAULT_CONFIG_PATH}");
-
-            if !Path::new(DEFAULT_RUST_VERSION_PATH).is_file() {
-                std::fs::write(DEFAULT_RUST_VERSION_PATH, "")
-                    .context("cannot write rust-version file")?;
-                println!("Created empty rust-version file at {DEFAULT_RUST_VERSION_PATH}");
-            } else {
-                println!("{DEFAULT_RUST_VERSION_PATH} already exists, not doing anything with it");
-            }
         }
         Command::Pull {
             upstream_repo,
@@ -119,7 +115,7 @@ fn main() -> anyhow::Result<()> {
             allow_noop,
             shared,
         } => {
-            let ctx = load_context(&shared.config_path, &shared.rust_version_path)?;
+            let ctx = load_context(&shared)?;
             let josh = get_josh_proxy(&shared, &ctx.config)?;
             let sync = GitSync::new(ctx.clone(), josh, shared.verbose);
             match sync.rustc_pull(
@@ -159,7 +155,7 @@ fn main() -> anyhow::Result<()> {
             branch,
             shared,
         } => {
-            let ctx = load_context(&shared.config_path, &shared.rust_version_path)?;
+            let ctx = load_context(&shared)?;
             let josh = get_josh_proxy(&shared, &ctx.config)?;
             let sync = GitSync::new(ctx.clone(), josh, shared.verbose);
             match sync
@@ -179,7 +175,6 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Open PR with `subtree update` title to silence the `no-merges` triagebot check
             let title = format!("{} subtree update", ctx.config.repo);
             let head = get_current_head_sha(shared.verbose)?;
 
@@ -208,19 +203,25 @@ https://github.com/{upstream_repo}/compare/{push_owner}:{branch}?quick_pull=1&ti
     Ok(())
 }
 
-fn load_context(config_path: &Path, rust_version_path: &Path) -> anyhow::Result<SyncContext> {
-    let config = load_config(&config_path)
+fn load_context(args: &SharedArgs) -> anyhow::Result<SyncContext> {
+    let mut config = load_config(&args.config_path)
         .context("cannot load config. Run the `init` command to initialize it.")?;
-    let rust_version = std::fs::read_to_string(&rust_version_path)
-        .inspect_err(|err| eprintln!("Cannot load rust-version file: {err:?}"))
-        .map(|version| version.trim().to_string())
-        .map(Some)
-        .unwrap_or_default();
-    Ok(SyncContext {
-        config,
-        last_upstream_sha_path: rust_version_path.to_path_buf(),
-        last_upstream_sha: rust_version,
-    })
+    if let Some(mirror) = &args.mirror {
+        let (org, repo) = mirror
+            .split_once('/')
+            .context("mirror must be organization/repository")?;
+        config.org = org.to_string();
+        config.repo = repo.to_string();
+    }
+    if let Some(filter) = &args.filter {
+        config.path = None;
+        config.filter = Some(filter.clone());
+    }
+    if let Some(branch) = &args.upstream_branch {
+        config.upstream_branch = branch.clone();
+    }
+    config.validate()?;
+    Ok(SyncContext { config })
 }
 
 fn maybe_create_gh_pr(repo: &str, title: &str, description: &str) -> anyhow::Result<bool> {

@@ -7,6 +7,7 @@ use std::path::Path;
 pub struct JoshConfig {
     #[serde(default = "default_org")]
     pub org: String,
+    #[serde(default)]
     pub repo: String,
     #[serde(default = "default_upstream_repo")]
     pub upstream_repo: String,
@@ -44,6 +45,18 @@ pub struct JoshConfig {
 }
 
 impl JoshConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.org.is_empty() && !self.repo.is_empty(),
+            "mirror organization and repository are required"
+        );
+        anyhow::ensure!(
+            self.path.is_some() != self.filter.is_some(),
+            "specify exactly one of path and filter"
+        );
+        Ok(())
+    }
+
     pub fn full_repo_name(&self) -> String {
         format!("{}/{}", self.org, self.repo)
     }
@@ -150,13 +163,5 @@ pub fn load_config(path: &Path) -> anyhow::Result<JoshConfig> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("cannot load config file from {}", path.display()))?;
     let config: JoshConfig = toml::from_str(&data).context("cannot load config as TOML")?;
-    if config.path.is_some() == config.filter.is_some() {
-        return if config.path.is_some() {
-            Err(anyhow::anyhow!("Cannot specify both `path` and `filter`"))
-        } else {
-            Err(anyhow::anyhow!("Must specify one of `path` and `filter`"))
-        };
-    }
-
     Ok(config)
 }

@@ -1,11 +1,10 @@
 use crate::SyncContext;
 use crate::config::{JoshConfig, PostPullOperation};
 use crate::josh::{JoshFilter, JoshProxy, try_install_josh_filter};
-use crate::utils::{ensure_clean_git_state, is_inside_ci, prompt};
+use crate::utils::{ensure_clean_git_state, is_inside_ci};
 use crate::utils::{get_current_head_sha, run_command_at};
 use crate::utils::{run_command, stream_command};
 use anyhow::{Context, Error};
-use std::path::{Path, PathBuf};
 
 pub const DEFAULT_UPSTREAM_REPO: &str = "rust-lang/rust";
 
@@ -108,71 +107,9 @@ impl GitSync {
         );
 
         let orig_head = get_current_head_sha(self.verbose)?;
-        println!(
-            "previous upstream base: {}",
-            self.context
-                .last_upstream_sha
-                .as_deref()
-                .unwrap_or("<none>"),
-        );
         println!("new upstream base: {upstream_sha}");
         println!("original local HEAD: {orig_head}");
-
-        // If the upstream SHA hasn't changed from the latest sync, there is nothing to pull
-        // We distinguish this situation for tools that might not want to consider this to
-        // be an error.
-        if let Some(previous_base_commit) = self.context.last_upstream_sha.as_ref() {
-            if *previous_base_commit == upstream_sha {
-                return Err(RustcPullError::NothingToPull);
-            }
-        }
-
-        // Create a checkpoint to which we reset if something unusual happens
         let mut git_reset = GitResetOnDrop::new(orig_head, self.verbose);
-
-        // Update the last upstream SHA file. As a separate commit, since making it part of
-        // the merge has confused the heck out of josh in the past.
-        // We pass `--no-verify` to avoid running git hooks.
-        // We do this before the merge so that if there are merge conflicts, we have
-        // the right rust-version file while resolving them.
-        std::fs::write(
-            &self.context.last_upstream_sha_path,
-            &format!("{upstream_sha}\n"),
-        )
-        .with_context(|| {
-            anyhow::anyhow!(
-                "cannot write upstream SHA to {}",
-                self.context.last_upstream_sha_path.display()
-            )
-        })?;
-
-        let prep_message = format!(
-            r#"Prepare for merging from {upstream_repo}
-
-This updates {tracking_path} to {upstream_sha}."#,
-            tracking_path = self.context.last_upstream_sha_path.display(),
-        );
-
-        let rust_version_path = self
-            .context
-            .last_upstream_sha_path
-            .to_string_lossy()
-            .to_string();
-        // Add the file to git index, in case this is the first time we perform the sync
-        // Otherwise `git commit <file>` below wouldn't work.
-        run_command(&["git", "add", &rust_version_path], self.verbose)?;
-        run_command(
-            &[
-                "git",
-                "commit",
-                &rust_version_path,
-                "--no-verify",
-                "-m",
-                &prep_message,
-            ],
-            self.verbose,
-        )
-        .context("cannot create preparation commit")?;
 
         // Fetch given rustc commit.
         run_command(&["git", "fetch", &josh_url], self.verbose)
@@ -202,18 +139,12 @@ Pull recent changes from https://github.com/{upstream_repo} via Josh.
 
 Upstream ref: {upstream_repo}@{upstream_sha}
 Filtered ref: {sub_org}/{sub_repo}@{incoming_ref}
-Upstream diff: https://github.com/{upstream_repo}/compare/{prev_upstream_sha}...{upstream_sha}
 
 This merge was created using https://github.com/rust-lang/josh-sync.
 "#,
             upstream_head_short = &upstream_sha[..12],
             sub_org = self.context.config.org,
             sub_repo = self.context.config.repo,
-            prev_upstream_sha = self
-                .context
-                .last_upstream_sha
-                .as_deref()
-                .unwrap_or(&upstream_sha)
         );
 
         // Merge the fetched commit.
@@ -287,140 +218,66 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
 
     pub fn rustc_push(&self, username: &str, branch: &str) -> anyhow::Result<PushResult> {
         ensure_clean_git_state(self.verbose)?;
-
-        let base_upstream_sha = self.context.last_upstream_sha.clone().unwrap_or_default();
-        anyhow::ensure!(
-            base_upstream_sha.len() == 40
-                && base_upstream_sha.bytes().all(|b| b.is_ascii_hexdigit()),
-            "push requires a full upstream SHA in the tracking file"
-        );
         run_command(
             ["git", "check-ref-format", "--branch", branch],
             self.verbose,
         )?;
         let push_repo = self.context.config.push_repo(username)?;
-        if self.context.config.subtree_filter.is_some()
-            && (self.proxy.is_external() || is_inside_ci())
-        {
-            which::which("josh-filter").context(
-                "josh-filter must be provisioned on PATH before pushing with subtree-filter",
-            )?;
-        }
-
-        // Make sure josh is running.
-        let josh = self
-            .proxy
-            .start(&self.context.config)
-            .context("cannot start josh-proxy")?;
+        let josh = self.proxy.start(&self.context.config)?;
         let josh_url = josh.git_url(
             &push_repo,
             None,
             &construct_josh_filter(&self.context.config),
         );
-        let user_upstream_url = self.context.config.git_url(&push_repo);
-
-        // Subtree filters transform local paths; retain their existing round-trip behavior.
-        if self.context.config.subtree_filter.is_none() {
-            let base_url = josh.git_url(
-                &self.context.config.upstream_repo,
-                Some(&base_upstream_sha),
-                &construct_josh_filter(&self.context.config),
-            );
-            run_command(["git", "fetch", &base_url], self.verbose)?;
-            let tracking_path = self
-                .context
-                .last_upstream_sha_path
-                .to_str()
-                .context("tracking path must be UTF-8")?;
-            let exclude = format!(":(exclude,literal){tracking_path}");
-            let changes = run_command(
-                [
-                    "git",
-                    "diff",
-                    "--name-only",
-                    "FETCH_HEAD",
-                    "HEAD",
-                    "--",
-                    ".",
-                    &exclude,
-                ],
-                self.verbose,
-            )?;
-            if changes.is_empty() {
-                return Ok(PushResult::NothingToPush);
-            }
+        let branch_base = &self.context.config.upstream_branch;
+        let base = if branch_base == "HEAD" || branch_base.starts_with("refs/") {
+            branch_base.clone()
+        } else {
+            format!("refs/heads/{branch_base}")
+        };
+        run_command(["git", "fetch", &josh_url, &base], self.verbose)?;
+        let local_head = self.local_head(&self.context.config)?;
+        let common_base = run_command(
+            ["git", "merge-base", "FETCH_HEAD", &local_head],
+            self.verbose,
+        )?;
+        let changes = run_command(
+            ["git", "diff", "--name-only", &common_base, &local_head],
+            self.verbose,
+        )?;
+        if changes.is_empty() {
+            return Ok(PushResult::NothingToPush);
         }
 
-        let rustc_git = prepare_rustc_checkout(&self.context.config, self.verbose)
-            .context("cannot prepare rustc checkout")?;
-
-        // Prepare the branch. Pushing works much better if we use as base exactly
-        // the commit that we pulled from last time, so we use the `rust-version`
-        // file to find out which commit that would be.
-        println!("Preparing {user_upstream_url} (base: {base_upstream_sha})...");
-
-        // Check if the remote branch doesn't already exist
-        if !run_command_at(
-            &[
+        let target_ref = format!("refs/heads/{branch}");
+        let existing = run_command(
+            [
                 "git",
                 "ls-remote",
                 "--heads",
-                &user_upstream_url,
-                &format!("refs/heads/{branch}"),
+                &self.context.config.git_url(&push_repo),
+                &target_ref,
             ],
-            &rustc_git,
-            self.verbose,
-        )?
-        .is_empty()
-        {
-            return Err(anyhow::anyhow!(
-                "The branch '{branch}' seems to already exist in '{user_upstream_url}'. Please delete it and try again."
-            ));
-        }
-
-        // Download the base upstream SHA
-        run_command_at(
-            &[
-                "git",
-                "fetch",
-                &self
-                    .context
-                    .config
-                    .git_url(&self.context.config.upstream_repo),
-                &base_upstream_sha,
-            ],
-            &rustc_git,
-            self.verbose,
-        )
-        .context("cannot download latest upstream SHA")?;
-
-        // And push it to the user's fork's branch
-        run_command_at(
-            &[
-                "git",
-                "push",
-                &format!("--force-with-lease=refs/heads/{branch}:"),
-                &user_upstream_url,
-                &format!("{base_upstream_sha}:refs/heads/{branch}"),
-            ],
-            &rustc_git,
-            self.verbose,
-        )
-        .context("cannot push to your fork")?;
-        println!();
-
-        // Do the actual push from the subtree git repo
-        println!("Pushing changes...");
-        run_command(
-            &["git", "push", &josh_url, &format!("HEAD:{branch}")],
             self.verbose,
         )?;
-        println!();
-
-        // Do a round-trip check to make sure the push worked as expected.
-        self.roundtrip_check(&self.context.config, &josh_url, &branch)?;
+        anyhow::ensure!(
+            existing.is_empty(),
+            "target branch already exists: {push_repo}/{branch}"
+        );
+        run_command(
+            [
+                "git",
+                "push",
+                "-o",
+                &format!("base={base}"),
+                &format!("--force-with-lease={target_ref}:"),
+                &josh_url,
+                &format!("HEAD:{target_ref}"),
+            ],
+            self.verbose,
+        )?;
+        self.roundtrip_check(&self.context.config, &josh_url, branch)?;
         println!("{NO_REBASE_WARN}");
-
         Ok(PushResult::Pushed)
     }
 
@@ -445,6 +302,21 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
         Ok(())
     }
 
+    fn local_head(&self, config: &JoshConfig) -> anyhow::Result<String> {
+        if let Some(subtree_filter) = &config.subtree_filter {
+            let josh_filter = get_josh_filter(self.verbose, self.proxy.is_external())?;
+            josh_filter.run(
+                &[subtree_filter, "HEAD"],
+                &std::env::current_dir().unwrap(),
+                self.verbose,
+            )?;
+            run_command(&["git", "rev-parse", "FILTERED_HEAD"], self.verbose)
+                .context("failed to get FILTERED_HEAD")
+        } else {
+            get_current_head_sha(self.verbose)
+        }
+    }
+
     fn roundtrip_check(
         &self,
         config: &JoshConfig,
@@ -456,18 +328,7 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
             &std::env::current_dir().unwrap(),
             self.verbose,
         )?;
-        let head = if let Some(subtree_filter) = &config.subtree_filter {
-            let josh_filter = get_josh_filter(self.verbose, self.proxy.is_external())?;
-            josh_filter.run(
-                &[subtree_filter, "HEAD"],
-                &std::env::current_dir().unwrap(),
-                self.verbose,
-            )?;
-            run_command(&["git", "rev-parse", "FILTERED_HEAD"], self.verbose)
-                .context("failed to get FILTERED_HEAD")?
-        } else {
-            get_current_head_sha(self.verbose)?
-        };
+        let head = self.local_head(config)?;
         let fetch_head = run_command(&["git", "rev-parse", "FETCH_HEAD"], self.verbose)?;
         if head != fetch_head {
             return Err(anyhow::anyhow!(
@@ -497,49 +358,6 @@ fn get_josh_filter(verbose: bool, external_proxy: bool) -> anyhow::Result<JoshFi
         Some(filter) => Ok(filter),
         None => Err(anyhow::anyhow!("Could not install josh-filter")),
     }
-}
-
-/// Find a rustc repo we can do our push preparation in.
-fn prepare_rustc_checkout(config: &JoshConfig, verbose: bool) -> anyhow::Result<PathBuf> {
-    if let Ok(rustc_git) = std::env::var("RUSTC_GIT") {
-        let rustc_git = PathBuf::from(rustc_git);
-        assert!(
-            rustc_git.is_dir(),
-            "rustc checkout path must be a directory"
-        );
-        return Ok(rustc_git);
-    };
-
-    // Otherwise, download it
-    let path = "rustc-checkout";
-    if !Path::new(path).join(".git").exists() {
-        if prompt(
-            &format!(
-                "Path to a rustc checkout is not configured via the RUSTC_GIT environment variable, and {path} directory was not found. Do you want to download a rustc checkout into {path}?",
-            ),
-            // Download git history if we are on CI
-            true,
-        ) {
-            println!(
-                "Cloning rustc into `{path}`. Use RUSTC_GIT environment variable to override the location of the checkout"
-            );
-            // Stream stdout/stderr to the terminal, so that the user sees clone progress
-            stream_command(
-                &[
-                    "git",
-                    "clone",
-                    "--filter=blob:none",
-                    &config.git_url(&config.upstream_repo),
-                    path,
-                ],
-                verbose,
-            )
-            .context("cannot clone rustc")?;
-        } else {
-            return Err(anyhow::anyhow!("cannot continue without a rustc checkout"));
-        }
-    }
-    Ok(PathBuf::from(path))
 }
 
 /// Restores HEAD to `reset_to` on drop, unless `disarm` is called first.
