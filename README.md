@@ -1,12 +1,32 @@
 # Josh sync utilities
 This repository contains a binary utility for performing [Josh](https://github.com/josh-project/josh)
-synchronizations (pull and push) of Josh subtrees in the [rust-lang/rust] repository.
+synchronizations (pull and push) between a configured upstream repository and its subtrees.
+
+## Configurable upstream fork
+
+This fork retains the synchronization algorithm from upstream revision
+`a52ea5c02ec17bd0556ab99b0b4297846c1a0154`. Set `upstream-repo` and
+`upstream-branch` in `josh-sync.toml` to select the source; `org`/`repo` still
+identify the mirror. `push-repo` selects the upstream repository or fork that
+receives a new branch. With it configured, use `rustc-josh-sync push <branch>`;
+the existing optional username selects `<username>/<upstream-repository-name>`.
+
+Set `proxy-url`, `--proxy-url`, or `JOSH_PROXY_URL` to use an externally managed
+Josh proxy. CI requires this mode and never installs or starts Josh. Provision
+`josh-filter` on PATH when using `subtree-filter`. The proxy's configured remote
+must match `github-url` (default `https://github.com`), which also allows local
+Git HTTP fixtures. CLI/environment proxy selection overrides TOML.
+
+`--rust-version-path` selects the tracking file; `RUSTC_GIT` selects a separate
+upstream checkout for push preparation. Keep both checkouts isolated per job.
+Push refuses existing target branches and protects creation against races.
+Preserve the generated merge history: do not squash or rebase sync commits.
 
 ## Installation
 You can install the binary `rustc-josh-sync` tool using the following command:
 
 ```bash
-$ cargo install --locked --git https://github.com/rust-lang/josh-sync
+$ cargo install --locked --path .
 ```
 
 ## Creating config file
@@ -43,48 +63,11 @@ A push operation takes changes performed in the subtree repository and merges th
 
 3) Send a PR to [rust-lang/rust]
 
-## Automating pulls on CI
+## Automation
 
-This repository contains a reusable workflow for performing the `pull` operation from CI. The workflow does the following:
-
-1) Installs `rustc-josh-sync` and `josh`
-2) Performs a `pull` operation
-3) Either creates a new PR (if it did not exist) with the resulting pull branch or force-pushes to an existing PR on the subtree repository
-4) (optional) If a failure (usually a merge conflict) has happened, or a PR has been opened for more than a week without a merge, it posts a message to a Zulip stream
-
-Here is an example of how you can use the workflow in a subtree repository:
-
-```yaml
-name: rustc-pull
-
-on:
-  workflow_dispatch:
-  schedule:
-    # Run at 04:00 UTC every Monday and Thursday
-    - cron: '0 4 * * 1,4'
-
-env:
-  # Optional to print detailed command logs
-  JOSH_SYNC_VERBOSE: true
-
-jobs:
-  pull:
-    uses: rust-lang/josh-sync/.github/workflows/rustc-pull.yml@main
-    with:
-      github-app-id: ${{ vars.APP_CLIENT_ID }}
-      # Must end with [bot]
-      pr-author: "github-actions[bot]" 
-      # If you want the Zulip post functionality
-      #zulip-stream-id: 1234   # optional
-      #zulip-bot-email: subtree-gha-notif-bot@rust-lang.zulipchat.com # optional
-      pr-base-branch: master   # optional
-      branch-name: rustc-pull  # optional
-    secrets:
-      #zulip-api-token: <Zulip API TOKEN>     # optional
-      github-app-secret: ${{ secrets.APP_PRIVATE_KEY }}
-```
-
-You will need to have a GitHub app configured on the repository with permissions to create pull requests in order to use the workflow.
+Use the organization's reusable [Josh sync workflow](https://github.com/piktur/finance/blob/feature/ci-opt-mirror-routing/.github/workflows/josh-sync.yml).
+Nix provisions the binary and authenticated proxy on the homeserver. The workflow
+opens pull requests in either direction and preserves merge history.
 
 ## Git peculiarities
 

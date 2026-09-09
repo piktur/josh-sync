@@ -1,7 +1,7 @@
 use crate::SyncContext;
 use crate::config::{JoshConfig, PostPullOperation};
 use crate::josh::{JoshFilter, JoshProxy, try_install_josh_filter};
-use crate::utils::{ensure_clean_git_state, prompt};
+use crate::utils::{ensure_clean_git_state, is_inside_ci, prompt};
 use crate::utils::{get_current_head_sha, run_command_at};
 use crate::utils::{run_command, stream_command};
 use anyhow::{Context, Error};
@@ -42,6 +42,11 @@ pub struct PullResult {
     pub merge_commit_message: String,
 }
 
+pub enum PushResult {
+    Pushed,
+    NothingToPush,
+}
+
 pub struct GitSync {
     context: SyncContext,
     proxy: JoshProxy,
@@ -67,19 +72,25 @@ impl GitSync {
         let upstream_sha = if let Some(sha) = upstream_commit {
             sha
         } else {
+            let branch = &self.context.config.upstream_branch;
+            let upstream_ref = if branch == "HEAD" || branch.starts_with("refs/") {
+                branch.clone()
+            } else {
+                format!("refs/heads/{branch}")
+            };
             let out = run_command(
                 [
                     "git",
                     "ls-remote",
-                    &format!("https://github.com/{upstream_repo}"),
-                    "HEAD",
+                    &self.context.config.git_url(&upstream_repo),
+                    &upstream_ref,
                 ],
                 self.verbose,
             )
             .context("cannot fetch upstream commit")?;
             out.split_whitespace()
                 .next()
-                .unwrap_or_else(|| panic!("Could not obtain Rust repo HEAD from remote: '{out}'"))
+                .context("upstream branch was not advertised by the remote")?
                 .to_owned()
         };
 
@@ -138,7 +149,8 @@ impl GitSync {
         let prep_message = format!(
             r#"Prepare for merging from {upstream_repo}
 
-This updates the rust-version file to {upstream_sha}."#,
+This updates {tracking_path} to {upstream_sha}."#,
+            tracking_path = self.context.last_upstream_sha_path.display(),
         );
 
         let rust_version_path = self
@@ -190,7 +202,7 @@ Pull recent changes from https://github.com/{upstream_repo} via Josh.
 
 Upstream ref: {upstream_repo}@{upstream_sha}
 Filtered ref: {sub_org}/{sub_repo}@{incoming_ref}
-Upstream diff: https://github.com/{DEFAULT_UPSTREAM_REPO}/compare/{prev_upstream_sha}...{upstream_sha}
+Upstream diff: https://github.com/{upstream_repo}/compare/{prev_upstream_sha}...{upstream_sha}
 
 This merge was created using https://github.com/rust-lang/josh-sync.
 "#,
@@ -273,10 +285,27 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
         })
     }
 
-    pub fn rustc_push(&self, username: &str, branch: &str) -> anyhow::Result<()> {
+    pub fn rustc_push(&self, username: &str, branch: &str) -> anyhow::Result<PushResult> {
         ensure_clean_git_state(self.verbose)?;
 
         let base_upstream_sha = self.context.last_upstream_sha.clone().unwrap_or_default();
+        anyhow::ensure!(
+            base_upstream_sha.len() == 40
+                && base_upstream_sha.bytes().all(|b| b.is_ascii_hexdigit()),
+            "push requires a full upstream SHA in the tracking file"
+        );
+        run_command(
+            ["git", "check-ref-format", "--branch", branch],
+            self.verbose,
+        )?;
+        let push_repo = self.context.config.push_repo(username)?;
+        if self.context.config.subtree_filter.is_some()
+            && (self.proxy.is_external() || is_inside_ci())
+        {
+            which::which("josh-filter").context(
+                "josh-filter must be provisioned on PATH before pushing with subtree-filter",
+            )?;
+        }
 
         // Make sure josh is running.
         let josh = self
@@ -284,14 +313,46 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
             .start(&self.context.config)
             .context("cannot start josh-proxy")?;
         let josh_url = josh.git_url(
-            &format!("{username}/rust"),
+            &push_repo,
             None,
             &construct_josh_filter(&self.context.config),
         );
-        let user_upstream_url = format!("https://github.com/{username}/rust");
+        let user_upstream_url = self.context.config.git_url(&push_repo);
 
-        let rustc_git =
-            prepare_rustc_checkout(self.verbose).context("cannot prepare rustc checkout")?;
+        // Subtree filters transform local paths; retain their existing round-trip behavior.
+        if self.context.config.subtree_filter.is_none() {
+            let base_url = josh.git_url(
+                &self.context.config.upstream_repo,
+                Some(&base_upstream_sha),
+                &construct_josh_filter(&self.context.config),
+            );
+            run_command(["git", "fetch", &base_url], self.verbose)?;
+            let tracking_path = self
+                .context
+                .last_upstream_sha_path
+                .to_str()
+                .context("tracking path must be UTF-8")?;
+            let exclude = format!(":(exclude,literal){tracking_path}");
+            let changes = run_command(
+                [
+                    "git",
+                    "diff",
+                    "--name-only",
+                    "FETCH_HEAD",
+                    "HEAD",
+                    "--",
+                    ".",
+                    &exclude,
+                ],
+                self.verbose,
+            )?;
+            if changes.is_empty() {
+                return Ok(PushResult::NothingToPush);
+            }
+        }
+
+        let rustc_git = prepare_rustc_checkout(&self.context.config, self.verbose)
+            .context("cannot prepare rustc checkout")?;
 
         // Prepare the branch. Pushing works much better if we use as base exactly
         // the commit that we pulled from last time, so we use the `rust-version`
@@ -299,12 +360,18 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
         println!("Preparing {user_upstream_url} (base: {base_upstream_sha})...");
 
         // Check if the remote branch doesn't already exist
-        if run_command_at(
-            &["git", "fetch", &user_upstream_url, branch],
+        if !run_command_at(
+            &[
+                "git",
+                "ls-remote",
+                "--heads",
+                &user_upstream_url,
+                &format!("refs/heads/{branch}"),
+            ],
             &rustc_git,
             self.verbose,
-        )
-        .is_ok()
+        )?
+        .is_empty()
         {
             return Err(anyhow::anyhow!(
                 "The branch '{branch}' seems to already exist in '{user_upstream_url}'. Please delete it and try again."
@@ -316,7 +383,10 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
             &[
                 "git",
                 "fetch",
-                &format!("https://github.com/{DEFAULT_UPSTREAM_REPO}"),
+                &self
+                    .context
+                    .config
+                    .git_url(&self.context.config.upstream_repo),
                 &base_upstream_sha,
             ],
             &rustc_git,
@@ -329,6 +399,7 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
             &[
                 "git",
                 "push",
+                &format!("--force-with-lease=refs/heads/{branch}:"),
                 &user_upstream_url,
                 &format!("{base_upstream_sha}:refs/heads/{branch}"),
             ],
@@ -350,7 +421,7 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
         self.roundtrip_check(&self.context.config, &josh_url, &branch)?;
         println!("{NO_REBASE_WARN}");
 
-        Ok(())
+        Ok(PushResult::Pushed)
     }
 
     fn has_empty_diff(&self, baseline_sha: &str) -> bool {
@@ -386,7 +457,7 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
             self.verbose,
         )?;
         let head = if let Some(subtree_filter) = &config.subtree_filter {
-            let josh_filter = get_josh_filter(self.verbose)?;
+            let josh_filter = get_josh_filter(self.verbose, self.proxy.is_external())?;
             josh_filter.run(
                 &[subtree_filter, "HEAD"],
                 &std::env::current_dir().unwrap(),
@@ -400,12 +471,12 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
         let fetch_head = run_command(&["git", "rev-parse", "FETCH_HEAD"], self.verbose)?;
         if head != fetch_head {
             return Err(anyhow::anyhow!(
-                "Josh created a non-roundtrip push! Do NOT merge this into rustc!\n\
+                "Josh created a non-roundtrip push! Do NOT merge this upstream!\n\
                 Expected {head}, got {fetch_head}."
             ));
         }
         println!(
-            "Confirmed that the push round-trips back to {} properly. Please create a rustc PR.",
+            "Confirmed that the push round-trips back to {} properly. Please create an upstream PR.",
             self.context.config.repo
         );
         Ok(())
@@ -413,7 +484,14 @@ After you fix the conflicts, `git add` the changes and run `git merge --continue
 }
 
 // This is called only when the `subtree-filter` is set.
-fn get_josh_filter(verbose: bool) -> anyhow::Result<JoshFilter> {
+fn get_josh_filter(verbose: bool, external_proxy: bool) -> anyhow::Result<JoshFilter> {
+    if let Ok(path) = which::which("josh-filter") {
+        return Ok(JoshFilter::from_path(path));
+    }
+    anyhow::ensure!(
+        !external_proxy && !is_inside_ci(),
+        "josh-filter must be provisioned on PATH for subtree-filter checks"
+    );
     println!("Updating/installing josh-filter binary...");
     match try_install_josh_filter(verbose) {
         Some(filter) => Ok(filter),
@@ -422,7 +500,7 @@ fn get_josh_filter(verbose: bool) -> anyhow::Result<JoshFilter> {
 }
 
 /// Find a rustc repo we can do our push preparation in.
-fn prepare_rustc_checkout(verbose: bool) -> anyhow::Result<PathBuf> {
+fn prepare_rustc_checkout(config: &JoshConfig, verbose: bool) -> anyhow::Result<PathBuf> {
     if let Ok(rustc_git) = std::env::var("RUSTC_GIT") {
         let rustc_git = PathBuf::from(rustc_git);
         assert!(
@@ -451,7 +529,7 @@ fn prepare_rustc_checkout(verbose: bool) -> anyhow::Result<PathBuf> {
                     "git",
                     "clone",
                     "--filter=blob:none",
-                    &format!("https://github.com/{DEFAULT_UPSTREAM_REPO}"),
+                    &config.git_url(&config.upstream_repo),
                     path,
                 ],
                 verbose,
