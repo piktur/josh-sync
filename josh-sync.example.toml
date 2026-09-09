@@ -5,6 +5,13 @@ repo = "stdarch"
 # Path where the subtree is located in rust-lang/rust
 path = "library/stdarch"
 
+# Optional upstream and proxy overrides; defaults retain the Rust repository.
+#upstream-repo = "piktur/finance"
+#upstream-branch = "master"
+#push-repo = "piktur/finance"
+#proxy-url = "http://josh-proxy:8000"
+#github-url = "https://github.com"
+
 # Optionally, you can specify the complete Josh filter for complex cases
 # Note that this option is mutually exclusive with `path`
 #filter = ...

@@ -208,6 +208,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
+name = "josh-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "directories",
+ "regex",
+ "serde",
+ "toml",
+ "urlencoding",
+ "which",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.174"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -304,20 +318,6 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "rustc-josh-sync"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "directories",
- "regex",
- "serde",
- "toml",
- "urlencoding",
- "which",
-]
 
 [[package]]
 name = "rustix"
